@@ -8,16 +8,17 @@ use std::{
 };
 
 use eldenring::{
-    cs::{CSWindowImp, CSWindowType},
-    position::HavokPosition,
+    cs::{CSCamera, CSEzDraw, CSWindowImp, CSWindowType, EzDrawTextCoordMode, RendMan},
+    util::system::wait_for_system_init,
 };
-use eldenring_util::{program::Program, singleton::get_instance, system::wait_for_system_init};
+use fromsoftware_shared::{F32Vector2, F32Vector4, FromStatic, Program};
+use nalgebra::Vector3;
 
 use crate::logging::{custom_panic_hook, setup_logging};
 use crossbeam_queue::ArrayQueue;
 use hudhook::{
     Hudhook, ImguiRenderLoop, RenderContext,
-    imgui::{self, FontGlyphRanges, Ui},
+    imgui::{self, Ui},
     windows::Win32::{
         Foundation::HINSTANCE,
         System::{LibraryLoader::DisableThreadLibraryCalls, SystemServices::DLL_PROCESS_ATTACH},
@@ -28,16 +29,14 @@ use pelite::pe::Pe;
 use retour::static_detour;
 
 static TEXT_RENDER_QUEUE: LazyLock<ArrayQueue<DrawCommand>> =
-    LazyLock::new(|| ArrayQueue::new(10000));
+    LazyLock::new(|| ArrayQueue::new(1024 * 10));
 
-const BASE_IMGUI_FONT_SIZE_PX: f32 = 13.0;
+const BASE_IMGUI_FONT_SIZE_PX: f32 = 24.0;
 
 #[derive(Debug)]
 enum DrawCommand {
-    Text(String, f32, f32),
-    SetFontSize(f32),
-    SetTextScale(f32, f32, f32),
-    ResetTextScale,
+    Text(String, f32, f32, f32, EzDrawTextCoordMode),
+    SetOffset(f32, f32),
 }
 
 fn u16_ptr_to_string(ptr: *const u16) -> String {
@@ -49,85 +48,48 @@ fn u16_ptr_to_string(ptr: *const u16) -> String {
     String::from_utf16(slice).unwrap_or(String::from("?EncodingError?"))
 }
 
-// void FUN_14264ef60(CSEzDraw *param_1,FloatVector4 *param_2,wchar_t *param_3)
+// void CS::CSEzDraw::DrawText(CSEzDraw *param_1,FloatVector4 *param_2,wchar_t *param_3)
 const TEXT_RENDER_REQUEST_RVA: u32 = 0x264efc0;
-// void CS::CSEzDraw::SetFontSize(CSEzDraw *param_1,float fontSize)
-const SET_FONT_SIZE_RVA: u32 = 0xbb6370;
-// void CS::CSEzDraw::SetTextScale(CSEzDraw *param_1,float textPosWidthScate,float textPosHeightScate,float fontSize)
-const SET_TEXT_SCALE_RVA: u32 = 0x1def10;
-// void CS::CSEzDraw::ResetTextScale(CSEzDraw *param_1)
-const RESET_TEXT_SCALE_RVA: u32 = 0xbb62f0;
-// void CS::CSEzDraw::DrawTextWithSize(CSEzDraw *param_1,FloatVector4 *param_2,float *param_3,wchar_t *param_4)
-const DRAW_TEXT_WITH_SIZE_RVA: u32 = 0x264ef20;
+// void CS::CSEzDraw::DrawTextWithOffset(CSEzDraw *param_1,FloatVector4 *param_2,float (*offset) [2],wchar_t *param_4)
+const DRAW_TEXT_WITH_OFFSET_RVA: u32 = 0x264ef20;
 
 static_detour! {
-    static DrawTextRenderRequest: unsafe extern "C" fn(usize, *mut HavokPosition, *const u16) -> ();
-    static SetFontSize: unsafe extern "C" fn(usize, f32) -> ();
-    static SetTextScale: unsafe extern "C" fn(usize, f32, f32, f32) -> ();
-    static ResetTextScale: unsafe extern "C" fn(usize) -> ();
-    static DrawTextWithSize: unsafe extern "C" fn(usize, *mut HavokPosition, *mut f32, *const u16) -> ();
+    static DrawTextRenderRequest: unsafe extern "C" fn(*mut CSEzDraw, *mut F32Vector4, *const u16) -> ();
+    static DrawTextWithOffset: unsafe extern "C" fn(*mut CSEzDraw, *mut F32Vector4, *mut F32Vector2, *const u16) -> ();
 }
 
 struct DebugTextRender {
-    text_scale: (f32, f32),
-    font_size: f32,
+    offset: (f32, f32),
 }
 impl DebugTextRender {
     fn new() -> Self {
-        Self {
-            text_scale: (1.0, 1.0),
-            font_size: 24.0,
-        }
+        Self { offset: (0.0, 0.0) }
     }
 
-    fn reset_size(&mut self) {
-        let window_size = Self::window_size();
-        let screen_size = Self::get_screen_size();
-        let aspect_w = screen_size[0] / window_size[0];
-        let aspect_h = screen_size[1] / window_size[1];
-        self.text_scale = (aspect_w, aspect_h);
+    fn window_size() -> (f32, f32) {
+        unsafe { CSWindowImp::instance() }
+            .map(|w| (w.screen_width as f32, w.screen_height as f32))
+            .unwrap_or((1920.0, 1080.0))
     }
 
-    fn get_aspect_ratios() -> (f32, f32) {
-        let window_size = Self::window_size();
-        let screen_size = Self::get_screen_size();
-        let mut aspect_w = screen_size[0] / window_size[0];
-        let mut aspect_h = screen_size[1] / window_size[1];
-        if aspect_w < 0.8 {
-            aspect_w = 0.8;
-        }
-        if aspect_h < 0.8 {
-            aspect_h = 0.8;
-        }
-        (aspect_w, aspect_h)
-    }
-
-    fn get_screen_size() -> [f32; 2] {
-        if let Ok(Some(window)) = unsafe { get_instance::<CSWindowImp>() } {
-            [window.screen_width as f32, window.screen_height as f32]
-        } else {
-            [1920.0, 1080.0]
-        }
-    }
-
-    fn window_size() -> [f32; 2] {
-        if let Ok(Some(window)) = unsafe { get_instance::<CSWindowImp>() } {
+    fn window_resolution() -> (f32, f32) {
+        if let Ok(window) = unsafe { CSWindowImp::instance() } {
             match window.persistent_window_config.window_type {
-                CSWindowType::Windowed => [
+                CSWindowType::Windowed => (
                     window.persistent_window_config.windowed_screen_width as f32,
                     window.persistent_window_config.windowed_screen_height as f32,
-                ],
-                CSWindowType::Fullscreen => [
+                ),
+                CSWindowType::Fullscreen => (
                     window.persistent_window_config.fullscreen_width as f32,
                     window.persistent_window_config.fullscreen_height as f32,
-                ],
-                CSWindowType::Borderless => [
+                ),
+                CSWindowType::Borderless => (
                     window.persistent_window_config.borderless_screen_width as f32,
                     window.persistent_window_config.borderless_screen_height as f32,
-                ],
+                ),
             }
         } else {
-            [1920.0, 1080.0]
+            (1920.0, 1080.0)
         }
     }
 }
@@ -136,6 +98,19 @@ impl ImguiRenderLoop for DebugTextRender {
     fn initialize(&mut self, ctx: &mut Context, _render_context: &mut dyn RenderContext) {
         let font_data = std::fs::read("C:\\Windows\\Fonts\\msgothic.ttc")
             .expect("Failed to read font file (msgothic.ttc)");
+        let glyph_ranges = imgui::FontGlyphRanges::from_slice(&[
+            0x0020, 0x00FF, // Basic Latin + Latin Supplement
+            0x3000, 0x30FF, // Japanese punctuation, Hiragana, Katakana
+            0x31F0, 0x31FF, // Katakana Phonetic Extensions
+            0x3400, 0x4DBF, // CJK Unified Ideographs Extension A
+            0x4E00, 0x9FFF, // CJK Unified Ideographs
+            0xF900, 0xFAFF, // CJK Compatibility Ideographs
+            0xFF00, 0xFFEF, // Halfwidth and Fullwidth Forms
+            0x2500, 0x257F, // Box Drawing
+            0x2580, 0x259F, // Block Elements (includes ■)
+            0x25A0, 0x25FF, // Geometric Shapes (includes ■ specifically)
+            0,
+        ]);
         ctx.fonts().add_font(&[imgui::FontSource::TtfData {
             data: &font_data,
             size_pixels: BASE_IMGUI_FONT_SIZE_PX,
@@ -143,7 +118,7 @@ impl ImguiRenderLoop for DebugTextRender {
                 oversample_h: 3,
                 oversample_v: 1,
                 pixel_snap_h: true,
-                glyph_ranges: FontGlyphRanges::japanese(),
+                glyph_ranges,
                 ..Default::default()
             }),
         }]);
@@ -163,31 +138,110 @@ impl ImguiRenderLoop for DebugTextRender {
             .collapsible(false)
             .title_bar(false)
             .build(|| ui.text("."));
-
+        let Ok(buffer) =
+            (unsafe { RendMan::instance().map(|rm| rm.debug_ez_draw.current_buffer()) })
+        else {
+            return;
+        };
+        let state = &buffer.ez_draw_state.base;
         while let Some(event) = TEXT_RENDER_QUEUE.pop() {
             match event {
-                DrawCommand::Text(text, x, y) => {
-                    tracing::debug!("Text: {} at ({}, {})", text, x, y);
+                DrawCommand::SetOffset(x, y) => {
+                    self.offset = (x, y);
+                }
+                DrawCommand::Text(text, x, y, z, render_mode) => {
+                    let (new_x, new_y) = match render_mode {
+                        EzDrawTextCoordMode::HavokPosition2
+                        | EzDrawTextCoordMode::HavokPosition3 => {
+                            let camera = unsafe { CSCamera::instance() }.unwrap();
+                            let cam = &camera.pers_cam_1;
 
-                    let scaled_x = x * self.text_scale.0;
-                    let scaled_y = y * self.text_scale.1;
-                    // normalize the coordinates to the screen space
-                    let window_size = Self::get_screen_size();
-                    let scaled_x = (scaled_x % window_size[0] + window_size[0]) % window_size[0];
-                    let scaled_y = (scaled_y % window_size[1] + window_size[1]) % window_size[1];
+                            let cam_right = cam.right();
+                            let cam_up = cam.up();
+                            let cam_forward = cam.forward();
+                            let cam_pos_h = cam.position();
+
+                            let cam_right_v = Vector3::new(cam_right.0, cam_right.1, cam_right.2);
+                            let cam_up_v = Vector3::new(cam_up.0, cam_up.1, cam_up.2);
+                            let cam_forward_v =
+                                Vector3::new(cam_forward.0, cam_forward.1, cam_forward.2);
+                            let cam_pos = Vector3::new(cam_pos_h.0, cam_pos_h.1, cam_pos_h.2);
+
+                            let world_pos = Vector3::new(x, y, z);
+                            let rel = world_pos - cam_pos;
+
+                            let z_cam = cam_forward_v.dot(&rel);
+                            if z_cam <= 0.0 {
+                                (f32::NAN, f32::NAN)
+                            } else {
+                                let x_cam = cam_right_v.dot(&rel);
+                                let y_cam = cam_up_v.dot(&rel);
+
+                                let fov_rad = cam.fov;
+                                let m11 = 1.0 / (0.5 * fov_rad).tan();
+                                let m00 = m11 / cam.aspect_ratio;
+
+                                let ndc_x = x_cam * m00 / z_cam;
+                                let ndc_y = y_cam * m11 / z_cam;
+
+                                let screen_size = Self::window_size();
+
+                                let screen_x = (ndc_x * 0.5 + 0.5) * screen_size.0;
+                                let screen_y = (ndc_y * -0.5 + 0.5) * screen_size.1;
+
+                                (screen_x, screen_y)
+                            }
+                        }
+                        EzDrawTextCoordMode::ScreenSpace0 | EzDrawTextCoordMode::ScreenSpace1 => {
+                            let resolution = Self::window_resolution();
+                            let size = Self::window_size();
+                            let scale_x = size.0 / resolution.0;
+                            let scale_y = size.1 / resolution.1;
+                            (x * scale_x, y * scale_y)
+                        }
+                        EzDrawTextCoordMode::Normalized4k => {
+                            let screen_size = Self::window_resolution();
+                            let diff_x: f32 = screen_size.0 / 3840.0;
+                            let diff_y: f32 = screen_size.1 / 2160.0;
+                            (x * diff_x, y * diff_y)
+                        }
+                        EzDrawTextCoordMode::Normalized1080p => {
+                            let screen_size = Self::window_resolution();
+                            let diff_x: f32 = screen_size.0 / 1920.0;
+                            let diff_y: f32 = screen_size.1 / 1080.0;
+                            (x * diff_x, y * diff_y)
+                        }
+                    };
+                    if !new_x.is_finite() || !new_y.is_finite() {
+                        continue;
+                    }
+
+                    let offset_x = new_x + self.offset.0;
+                    let offset_y = new_y + self.offset.1;
+                    self.offset = (0.0, 0.0);
+
+                    tracing::debug!(
+                        "Rendering text '{}' at screen position ({}, {})",
+                        text,
+                        offset_x,
+                        offset_y
+                    );
 
                     // Hash the coordinates and text to create a unique window name
                     let mut hasher = std::collections::hash_map::DefaultHasher::new();
                     (x as u32).hash(&mut hasher);
                     (y as u32).hash(&mut hasher);
-                    (scaled_x as u32).hash(&mut hasher);
-                    (scaled_y as u32).hash(&mut hasher);
+                    (offset_x as u32).hash(&mut hasher);
+                    (offset_y as u32).hash(&mut hasher);
                     text.hash(&mut hasher);
-
-                    ui.window(format!("text_window_{}_{}_{}", x, y, hasher.finish()))
-                        .size(Self::get_screen_size(), imgui::Condition::Always)
-                        .position([scaled_x, scaled_y], imgui::Condition::Always)
+                    let _guard = ui.push_id(hasher.finish().to_string());
+                    let window_size = Self::window_size();
+                    ui.window(format!("text_window_{x}_{y}"))
+                        .size([window_size.0, window_size.1], imgui::Condition::Always)
+                        .position([offset_x, offset_y], imgui::Condition::Always)
                         .no_decoration()
+                        .focus_on_appearing(false)
+                        .focused(false)
                         .draw_background(false)
                         .no_inputs()
                         .resizable(false)
@@ -195,44 +249,26 @@ impl ImguiRenderLoop for DebugTextRender {
                         .collapsible(false)
                         .title_bar(false)
                         .build(|| {
-                            let font_scale_factor = self.font_size / BASE_IMGUI_FONT_SIZE_PX;
-                            ui.set_window_font_scale(font_scale_factor);
+                            // Normalize color from [0-255] to [0.0-1.0]
+                            let text_color = state.text_color;
+                            let _ = ui.push_style_color(
+                                imgui::StyleColor::Text,
+                                [
+                                    text_color.r() as f32 / 255.0,
+                                    text_color.g() as f32 / 255.0,
+                                    text_color.b() as f32 / 255.0,
+                                    text_color.a() as f32 / 255.0,
+                                ],
+                            );
+
+                            // state.font_size is the pixel size the game wants (e.g., 18.0)
+                            // BASE_IMGUI_FONT_SIZE_PX is the size the font was loaded at (24.0)
+                            // Multiply by text_pos_height_scale to match game's resolution scaling
+                            let font_scale = state.font_size / BASE_IMGUI_FONT_SIZE_PX;
+
+                            ui.set_window_font_scale(font_scale);
                             ui.text(text);
                         });
-                }
-                DrawCommand::SetFontSize(mut scale) => {
-                    if scale == 0.0 {
-                        scale = BASE_IMGUI_FONT_SIZE_PX;
-                    }
-                    tracing::debug!("Font size: {}", scale);
-                    self.font_size = scale;
-                }
-
-                DrawCommand::SetTextScale(mut width_scale, mut height_scale, font_size) => {
-                    tracing::debug!(
-                        "Width scale: {}, Height scale: {}, Font size: {}",
-                        width_scale,
-                        height_scale,
-                        font_size
-                    );
-
-                    let (aspect_w, aspect_h) = Self::get_aspect_ratios();
-                    width_scale *= aspect_w;
-                    height_scale *= aspect_h;
-
-                    if width_scale != self.text_scale.0 || height_scale != self.text_scale.1 {
-                        self.text_scale = (width_scale, height_scale);
-                    }
-
-                    self.font_size = if font_size == 0.0 {
-                        BASE_IMGUI_FONT_SIZE_PX
-                    } else {
-                        font_size
-                    };
-                }
-                DrawCommand::ResetTextScale => {
-                    tracing::debug!("Reset text scale");
-                    self.reset_size();
                 }
             }
         }
@@ -248,92 +284,68 @@ fn init() {
     unsafe {
         DrawTextRenderRequest
             .initialize(
-                transmute::<u64, unsafe extern "C" fn(usize, *mut HavokPosition, *const u16)>(
+                transmute::<u64, unsafe extern "C" fn(*mut CSEzDraw, *mut F32Vector4, *const u16)>(
                     text_request_va,
                 ),
-                |_ez_draw: usize, pos: *mut HavokPosition, text: *const u16| {
+                |ez_draw: *mut CSEzDraw, pos: *mut F32Vector4, text: *const u16| {
                     let text_str = u16_ptr_to_string(text);
                     let x = (*pos).0;
                     let y = (*pos).1;
+                    let z = (*pos).2;
+                    let render_mode = (*ez_draw)
+                        .current_buffer()
+                        .ez_draw_state
+                        .base
+                        .text_coord_mode;
+                    tracing::debug!(
+                        "DrawTextRenderRequest: {:?},  {}, {:?}",
+                        render_mode,
+                        text_str,
+                        *pos
+                    );
 
-                    TEXT_RENDER_QUEUE.force_push(DrawCommand::Text(text_str, x, y));
+                    TEXT_RENDER_QUEUE.force_push(DrawCommand::Text(text_str, x, y, z, render_mode));
                 },
             )
             .unwrap()
             .enable()
             .unwrap();
     }
-    let set_font_size_va = program.rva_to_va(SET_FONT_SIZE_RVA).unwrap();
+    let draw_text_with_offset_va = program.rva_to_va(DRAW_TEXT_WITH_OFFSET_RVA).unwrap();
     unsafe {
-        SetFontSize
-            .initialize(
-                transmute::<u64, unsafe extern "C" fn(usize, f32)>(set_font_size_va),
-                |ez_draw: usize, font_size: f32| {
-                    SetFontSize.call(ez_draw, font_size);
-                    TEXT_RENDER_QUEUE.force_push(DrawCommand::SetFontSize(font_size));
-                },
-            )
-            .unwrap()
-            .enable()
-            .unwrap();
-    }
-    let set_text_scale_va = program.rva_to_va(SET_TEXT_SCALE_RVA).unwrap();
-    unsafe {
-        SetTextScale
-            .initialize(
-                transmute::<u64, unsafe extern "C" fn(usize, f32, f32, f32)>(set_text_scale_va),
-                |ez_draw: usize, width_scale: f32, height_scale: f32, font_size: f32| {
-                    SetTextScale.call(ez_draw, width_scale, height_scale, font_size);
-                    TEXT_RENDER_QUEUE.force_push(DrawCommand::SetTextScale(
-                        width_scale,
-                        height_scale,
-                        font_size,
-                    ));
-                },
-            )
-            .unwrap()
-            .enable()
-            .unwrap();
-    }
-    let reset_text_scale_va = program.rva_to_va(RESET_TEXT_SCALE_RVA).unwrap();
-    unsafe {
-        ResetTextScale
-            .initialize(
-                transmute::<u64, unsafe extern "C" fn(usize)>(reset_text_scale_va),
-                |ez_draw: usize| {
-                    ResetTextScale.call(ez_draw);
-                    TEXT_RENDER_QUEUE.force_push(DrawCommand::ResetTextScale);
-                },
-            )
-            .unwrap()
-            .enable()
-            .unwrap();
-    }
-    let draw_text_with_size_va = program.rva_to_va(DRAW_TEXT_WITH_SIZE_RVA).unwrap();
-    unsafe {
-        DrawTextWithSize
+        DrawTextWithOffset
             .initialize(
                 transmute::<
                     u64,
-                    unsafe extern "C" fn(usize, *mut HavokPosition, *mut f32, *const u16),
-                >(draw_text_with_size_va),
-                |_ez_draw: usize,
-                 pos: *mut HavokPosition,
-                 font_size_ptr: *mut f32,
+                    unsafe extern "C" fn(
+                        *mut CSEzDraw,
+                        *mut F32Vector4,
+                        *mut F32Vector2,
+                        *const u16,
+                    ),
+                >(draw_text_with_offset_va),
+                |ez_draw: *mut CSEzDraw,
+                 pos: *mut F32Vector4,
+                 offset: *mut F32Vector2,
                  text: *const u16| {
+                    TEXT_RENDER_QUEUE.force_push(DrawCommand::SetOffset((*offset).0, (*offset).1));
                     let text_str = u16_ptr_to_string(text);
                     let x = (*pos).0;
                     let y = (*pos).1;
+                    let z = (*pos).2;
 
-                    let font_size = *font_size_ptr;
-                    let push_font = if font_size == 0.0 {
-                        BASE_IMGUI_FONT_SIZE_PX
-                    } else {
-                        font_size
-                    };
-                    TEXT_RENDER_QUEUE.force_push(DrawCommand::SetFontSize(push_font));
+                    let current_buffer = (*ez_draw).current_buffer();
 
-                    TEXT_RENDER_QUEUE.force_push(DrawCommand::Text(text_str, x, y));
+                    let render_mode = current_buffer.ez_draw_state.base.text_coord_mode;
+                    tracing::debug!(
+                        "DrawTextWithOffset: {:?},  {}, {:?}, {:?}",
+                        render_mode,
+                        text_str,
+                        *pos,
+                        *offset
+                    );
+
+                    TEXT_RENDER_QUEUE.force_push(DrawCommand::Text(text_str, x, y, z, render_mode));
                 },
             )
             .unwrap()
@@ -366,6 +378,7 @@ pub unsafe extern "C" fn DllMain(hinst: HINSTANCE, reason: u32, _reserved: usize
     if reason == DLL_PROCESS_ATTACH {
         unsafe { DisableThreadLibraryCalls(hinst).ok() };
 
+        LazyLock::force(&TEXT_RENDER_QUEUE);
         init();
     };
     true
